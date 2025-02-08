@@ -4,10 +4,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -27,13 +29,14 @@ import (
 
 // Problem represents a coding problem.
 type Problem struct {
-	ID        uint           `gorm:"primaryKey" json:"id"`
-	Title     string         `json:"title"`
-	Question  string         `json:"question"`
-	Level     string         `json:"level"`
-	Tags      datatypes.JSON `json:"tags"`      // stored as a JSON array of strings
-	CodeStubs datatypes.JSON `json:"codeStubs"` // stored as a JSON object: language -> stub
-	TestCases []TestCase     `json:"testCases"` // one-to-many relation
+	ID           uint           `gorm:"primaryKey" json:"id"`
+	Title        string         `json:"title"`
+	Question     string         `json:"question"`
+	Level        string         `json:"level"`
+	Tags         datatypes.JSON `json:"tags"`         // stored as a JSON array of strings
+	CodeStubs    datatypes.JSON `json:"codeStubs"`    // stored as a JSON object: language -> stub
+	TestCases    []TestCase     `json:"testCases"`    // one-to-many relation
+	FunctionName string         `json:"functionName"` // the name of the function to call
 }
 
 // TestCase represents a sample test case for a problem.
@@ -300,6 +303,7 @@ func apiLeaderboard(c *gin.Context) {
 // ----------
 
 // submissionWorker processes queued submissions by executing code inside containers.
+// submissionWorker processes queued submissions by executing code inside containers.
 func submissionWorker() {
 	for subID := range submissionQueue {
 		// (Optional) Simulate container startup delay.
@@ -311,22 +315,92 @@ func submissionWorker() {
 			continue
 		}
 
-		// Execute the code in a container based on language.
-		var output string
-		var err error
+		// Process only Python submissions in this demo.
 		if sub.Language == "python" {
-			output, err = executePythonCodeInContainer(sub.Code)
-			if err != nil {
-				sub.Passed = false
-				sub.Output = "Execution error: " + err.Error()
-			} else {
-				// For demo purposes, consider the submission "passed" only if the output equals "pass"
-				if output == "pass\n" || output == "pass" {
-					sub.Passed = true
-				} else {
-					sub.Passed = false
+			// Load the problem along with its test cases.
+			var problem Problem
+			if err := db.Preload("TestCases").First(&problem, sub.ProblemID).Error; err != nil {
+				sub.Status = "completed"
+				sub.Output = "Error loading problem"
+				db.Save(&sub)
+				continue
+			}
+
+			// Use the function name stored in the problem record.
+			functionName := problem.FunctionName
+			if functionName == "" {
+				functionName = "solve" // default fallback if not set
+			}
+
+			// Iterate through each test case.
+			allPassed := true
+			details := ""
+			for i, tc := range problem.TestCases {
+				// Unmarshal the test case input.
+				var testInput interface{}
+				if err := json.Unmarshal(tc.Input, &testInput); err != nil {
+					details += fmt.Sprintf("Test case %d: invalid input format.\n", i+1)
+					allPassed = false
+					continue
 				}
-				sub.Output = output
+				var inputStr string
+				switch v := testInput.(type) {
+				case string:
+					inputStr = v
+				default:
+					bs, err := json.Marshal(v)
+					if err != nil {
+						inputStr = ""
+					} else {
+						inputStr = string(bs)
+					}
+				}
+
+				// Unmarshal the expected output.
+				var expected interface{}
+				if err := json.Unmarshal(tc.Output, &expected); err != nil {
+					details += fmt.Sprintf("Test case %d: invalid expected output format.\n", i+1)
+					allPassed = false
+					continue
+				}
+				var expectedStr string
+				switch v := expected.(type) {
+				case string:
+					expectedStr = v
+				default:
+					bs, err := json.Marshal(v)
+					if err != nil {
+						expectedStr = ""
+					} else {
+						expectedStr = string(bs)
+					}
+				}
+
+				// Execute the user's code for this test case.
+				output, err := executePythonCodeInContainerTest(sub.Code, functionName, inputStr)
+				if err != nil {
+					details += fmt.Sprintf("Test case %d: execution error: %s\n", i+1, err.Error())
+					allPassed = false
+					continue
+				}
+				output = strings.TrimSpace(output)
+				if output != expectedStr {
+					details += fmt.Sprintf("Test case %d failed: expected %s, got %s\n", i+1, expectedStr, output)
+					allPassed = false
+				} else {
+					details += fmt.Sprintf("Test case %d passed.\n", i+1)
+				}
+			}
+			if allPassed {
+				sub.Passed = true
+				sub.Output = "All test cases passed."
+			} else {
+				sub.Passed = false
+				sub.Output = details
+			}
+			sub.Status = "completed"
+			if err := db.Save(&sub).Error; err != nil {
+				log.Println("Error saving submission:", err)
 			}
 		} else {
 			// For unsupported languages, simulate a dummy evaluation.
@@ -337,43 +411,42 @@ func submissionWorker() {
 				sub.Passed = false
 				sub.Output = "Wrong Answer"
 			}
+			sub.Status = "completed"
+			if err := db.Save(&sub).Error; err != nil {
+				log.Println("Error saving submission:", err)
+			}
 		}
-		sub.Status = "completed"
-		db.Save(&sub)
 	}
 }
 
-// executePythonCodeInContainer runs Python code in a Docker container using the official python:3.8-slim image.
-func executePythonCodeInContainer(code string) (string, error) {
+func executePythonCodeInContainerTest(code, functionName, testInput string) (string, error) {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return "", err
 	}
+	// Wrap the submitted code so multi‑line code is handled properly.
+	wrapper := "exec('''" + code + "''')\n"
+	// Automatically call the target function with the test input.
+	// fmt.Sprintf("%q", testInput) ensures proper quoting.
+	wrapper += "print(" + functionName + "(" + fmt.Sprintf("%q", testInput) + "))\n"
 
-	// Build the command: run "python -c <code>"
-	cmd := []string{"python", "-c", code}
+	log.Println("Wrapper:", wrapper)
 
-	// Create the container.
+	cmd := []string{"python3", "-c", wrapper}
+
+	// Make sure to run this first: docker pull python:3.8-slim
 	resp, err := cli.ContainerCreate(ctx, &container.Config{
-		Image: "python:3.13.2-slim",
+		Image: "python:3.8-slim",
 		Cmd:   cmd,
 		Tty:   false,
 	}, nil, nil, nil, "")
 	if err != nil {
 		return "", err
 	}
-
-	log.Println("Container created with ID:", resp.ID)
-
-	// Start the container.
 	if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
 		return "", err
 	}
-
-	log.Println("Container started with ID:", resp.ID)
-
-	// Wait until the container finishes.
 	statusCh, errCh := cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
 	select {
 	case err := <-errCh:
@@ -382,10 +455,6 @@ func executePythonCodeInContainer(code string) (string, error) {
 		}
 	case <-statusCh:
 	}
-
-	log.Println("Container finished with ID:", resp.ID)
-
-	// Fetch container logs.
 	out, err := cli.ContainerLogs(ctx, resp.ID, container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
@@ -394,19 +463,11 @@ func executePythonCodeInContainer(code string) (string, error) {
 		return "", err
 	}
 	defer out.Close()
-
 	logBytes, err := ioutil.ReadAll(out)
 	if err != nil {
 		return "", err
 	}
-
-	log.Println("Container logs:", string(logBytes))
-
-	// Clean up the container.
 	cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
-
-	log.Println("Container removed with ID:", resp.ID)
-
 	return string(logBytes), nil
 }
 
@@ -429,11 +490,12 @@ func seedData() {
 		"javascript": "function twoSum(nums, target) {\n    // TODO\n}",
 	})
 	prob1 := Problem{
-		Title:     "Two Sum",
-		Question:  "Given an array of integers, return indices of the two numbers such that they add up to a specific target.",
-		Level:     "Easy",
-		Tags:      datatypes.JSON(tags1),
-		CodeStubs: datatypes.JSON(stubs1),
+		Title:        "Two Sum",
+		Question:     "Given an array of integers, return indices of the two numbers such that they add up to a specific target.",
+		Level:        "Easy",
+		Tags:         datatypes.JSON(tags1),
+		CodeStubs:    datatypes.JSON(stubs1),
+		FunctionName: "twoSum", // Store the function name to call.
 	}
 	db.Create(&prob1)
 
@@ -455,11 +517,12 @@ func seedData() {
 		"javascript": "function reverseString(s) {\n    // TODO\n}",
 	})
 	prob2 := Problem{
-		Title:     "Reverse String",
-		Question:  "Write a function that reverses a string.",
-		Level:     "Easy",
-		Tags:      datatypes.JSON(tags2),
-		CodeStubs: datatypes.JSON(stubs2),
+		Title:        "Reverse String",
+		Question:     "Write a function that reverses a string.",
+		Level:        "Easy",
+		Tags:         datatypes.JSON(tags2),
+		CodeStubs:    datatypes.JSON(stubs2),
+		FunctionName: "reverseString", // Store the function name to call.
 	}
 	db.Create(&prob2)
 

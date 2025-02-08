@@ -322,6 +322,7 @@ func submissionWorker() {
 			if err := db.Preload("TestCases").First(&problem, sub.ProblemID).Error; err != nil {
 				sub.Status = "completed"
 				sub.Output = "Error loading problem"
+				sub.Output = strings.ReplaceAll(sub.Output, "\x00", "") // sanitize output
 				db.Save(&sub)
 				continue
 			}
@@ -383,9 +384,14 @@ func submissionWorker() {
 					allPassed = false
 					continue
 				}
+
 				output = strings.TrimSpace(output)
+
+				// Sanitize the output by removing null bytes.
+				output = strings.ReplaceAll(output, "\x00", "")
+
 				if output != expectedStr {
-					details += fmt.Sprintf("Test case %d failed: expected %s, got %s\n", i+1, expectedStr, output)
+					details += fmt.Sprintf("Test case %d failed: expected `%s`, got `%s`\n", i+1, expectedStr, output)
 					allPassed = false
 				} else {
 					details += fmt.Sprintf("Test case %d passed.\n", i+1)
@@ -399,9 +405,9 @@ func submissionWorker() {
 				sub.Output = details
 			}
 			sub.Status = "completed"
-			if err := db.Save(&sub).Error; err != nil {
-				log.Println("Error saving submission:", err)
-			}
+			// Sanitize final output before saving to DB.
+			sub.Output = strings.ReplaceAll(sub.Output, "\x00", "")
+			db.Save(&sub)
 		} else {
 			// For unsupported languages, simulate a dummy evaluation.
 			if sub.Code == "pass" {
@@ -412,9 +418,8 @@ func submissionWorker() {
 				sub.Output = "Wrong Answer"
 			}
 			sub.Status = "completed"
-			if err := db.Save(&sub).Error; err != nil {
-				log.Println("Error saving submission:", err)
-			}
+			sub.Output = strings.ReplaceAll(sub.Output, "\x00", "")
+			db.Save(&sub)
 		}
 	}
 }
@@ -439,7 +444,7 @@ func executePythonCodeInContainerTest(code, functionName, testInput string) (str
 	resp, err := cli.ContainerCreate(ctx, &container.Config{
 		Image: "python:3.8-slim",
 		Cmd:   cmd,
-		Tty:   false,
+		Tty:   true,
 	}, nil, nil, nil, "")
 	if err != nil {
 		return "", err

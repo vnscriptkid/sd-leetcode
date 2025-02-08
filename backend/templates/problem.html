@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>CodeJudge - Problem {{.Problem.ID}}</title>
+</head>
+<body>
+    <h1>{{.Problem.Title}}</h1>
+    <p>{{.Problem.Question}}</p>
+    <h3>Code Stub (Python):</h3>
+    <pre id="codeStub">{{.CodeStub}}</pre>
+    <h3>Submit Your Code</h3>
+    <form id="submissionForm">
+      <input type="hidden" id="problemId" value="{{.Problem.ID}}">
+      <input type="hidden" id="language" value="python">
+      Your User ID: <input type="text" id="userId" value="user123"><br>
+      <textarea id="code" rows="10" cols="50" placeholder="Enter your code here"></textarea><br>
+      <button type="submit">Submit</button>
+    </form>
+    <div id="result"></div>
+    <script>
+      document.getElementById("submissionForm").addEventListener("submit", function(e) {
+          e.preventDefault();
+          var problemId = document.getElementById("problemId").value;
+          var language = document.getElementById("language").value;
+          var userId = document.getElementById("userId").value;
+          var code = document.getElementById("code").value;
+          fetch("/api/problems/" + problemId + "/submit", {
+              method: "POST",
+              headers: {
+                  "Content-Type": "application/json",
+                  "X-User-ID": userId
+              },
+              body: JSON.stringify({ code: code, language: language })
+          })
+          .then(response => response.json())
+          .then(data => {
+              var submissionId = data.submissionId;
+              document.getElementById("result").innerText = "Submission received. Checking status...";
+              var interval = setInterval(function(){
+                  fetch("/api/check/" + submissionId)
+                  .then(response => response.json())
+                  .then(submission => {
+                      if(submission.status === "completed") {
+                          clearInterval(interval);
+                          if(submission.passed) {
+                              document.getElementById("result").innerText = "Result: Passed! Output: " + submission.output;
+                          } else {
+                              document.getElementById("result").innerText = "Result: Failed. Output: " + submission.output;
+                          }
+                      }
+                  });
+              }, 2000);
+          });
+      });
+    </script>
+</body>
+</html>

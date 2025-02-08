@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>CodeJudge - Problems</title>
+</head>
+<body>
+    <h1>Problems</h1>
+    <ul>
+    {{range .Problems}}
+      <li>
+        <a href="/problem/{{.ID}}">{{.Title}}</a> - {{.Level}}
+      </li>
+    {{end}}
+    </ul>
+</body>
+</html>

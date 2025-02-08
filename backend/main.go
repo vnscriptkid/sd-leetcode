@@ -2,7 +2,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"strconv"
@@ -12,6 +14,11 @@ import (
 	"gorm.io/datatypes"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+
+	// Docker SDK packages:
+
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/client"
 )
 
 // ----------
@@ -67,7 +74,7 @@ var (
 
 func main() {
 	// Connect to PostgreSQL.
-	// Adjust the DSN (Data Source Name) as appropriate for your setup.
+	// Adjust the DSN as appropriate for your setup.
 	dsn := "host=localhost user=postgres password=123456 dbname=postgres port=5432 sslmode=disable TimeZone=UTC"
 	var err error
 	db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
@@ -289,35 +296,118 @@ func apiLeaderboard(c *gin.Context) {
 }
 
 // ----------
-// Background Worker
+// Background Worker & Containerized Code Execution
 // ----------
 
-// submissionWorker simulates processing of code submissions.
-// In a real system this would run the submitted code in an isolated container.
+// submissionWorker processes queued submissions by executing code inside containers.
 func submissionWorker() {
 	for subID := range submissionQueue {
-		// Simulate a delay (e.g. container startup + execution time).
+		// (Optional) Simulate container startup delay.
 		time.Sleep(2 * time.Second)
 
-		// Fetch the submission from the DB.
+		// Fetch the submission from the database.
 		var sub Submission
 		if err := db.First(&sub, subID).Error; err != nil {
 			continue
 		}
 
-		// Dummy evaluation: if code equals "pass" then it passes.
-		if sub.Code == "pass" {
-			sub.Passed = true
-			sub.Output = "Correct Answer"
+		// Execute the code in a container based on language.
+		var output string
+		var err error
+		if sub.Language == "python" {
+			output, err = executePythonCodeInContainer(sub.Code)
+			if err != nil {
+				sub.Passed = false
+				sub.Output = "Execution error: " + err.Error()
+			} else {
+				// For demo purposes, consider the submission "passed" only if the output equals "pass"
+				if output == "pass\n" || output == "pass" {
+					sub.Passed = true
+				} else {
+					sub.Passed = false
+				}
+				sub.Output = output
+			}
 		} else {
-			sub.Passed = false
-			sub.Output = "Wrong Answer"
+			// For unsupported languages, simulate a dummy evaluation.
+			if sub.Code == "pass" {
+				sub.Passed = true
+				sub.Output = "Correct Answer"
+			} else {
+				sub.Passed = false
+				sub.Output = "Wrong Answer"
+			}
 		}
 		sub.Status = "completed"
-
-		// Update the submission record.
 		db.Save(&sub)
 	}
+}
+
+// executePythonCodeInContainer runs Python code in a Docker container using the official python:3.8-slim image.
+func executePythonCodeInContainer(code string) (string, error) {
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return "", err
+	}
+
+	// Build the command: run "python -c <code>"
+	cmd := []string{"python", "-c", code}
+
+	// Create the container.
+	resp, err := cli.ContainerCreate(ctx, &container.Config{
+		Image: "python:3.13.2-slim",
+		Cmd:   cmd,
+		Tty:   false,
+	}, nil, nil, nil, "")
+	if err != nil {
+		return "", err
+	}
+
+	log.Println("Container created with ID:", resp.ID)
+
+	// Start the container.
+	if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		return "", err
+	}
+
+	log.Println("Container started with ID:", resp.ID)
+
+	// Wait until the container finishes.
+	statusCh, errCh := cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
+	select {
+	case err := <-errCh:
+		if err != nil {
+			return "", err
+		}
+	case <-statusCh:
+	}
+
+	log.Println("Container finished with ID:", resp.ID)
+
+	// Fetch container logs.
+	out, err := cli.ContainerLogs(ctx, resp.ID, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+	})
+	if err != nil {
+		return "", err
+	}
+	defer out.Close()
+
+	logBytes, err := ioutil.ReadAll(out)
+	if err != nil {
+		return "", err
+	}
+
+	log.Println("Container logs:", string(logBytes))
+
+	// Clean up the container.
+	cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
+
+	log.Println("Container removed with ID:", resp.ID)
+
+	return string(logBytes), nil
 }
 
 // ----------
